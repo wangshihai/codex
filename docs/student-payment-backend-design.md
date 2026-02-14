@@ -1,100 +1,86 @@
-# 学生校服支付后端（Go + 微信支付）详细设计（可落地版）
+# 学生校服支付后端（Go + 微信支付）设计方案
 
-> 适用场景：学校统一收取校服费，约 2000 学生，学生通过微信小程序完成支付，管理员在后台建单/退款/对账。
+## 1. 目标与规模
 
----
-
-## 1. 目标与非目标
-
-### 1.1 目标
-- 支持管理员创建单个/批量校服订单。
-- 学生在小程序中查看并支付订单（微信 JSAPI）。
-- 支持支付回调、退款回调、手动退款。
-- 支持每日自动对账与差异工单。
-- 支持审计追踪（谁创建订单、谁退款、回调原文）。
-
-### 1.2 非目标（首期可不做）
-- 不做复杂优惠券与满减。
-- 不做多支付渠道（先只做微信支付）。
-- 不做复杂分账（后续如需可扩展）。
+- **业务目标**：学校给学生创建“校服订单”，学生在小程序中完成支付，后端完成对账、状态流转、退款、通知。
+- **用户规模**：约 2000 名学生（中小规模）。
+- **技术目标**：稳定、可审计、易扩展，满足微信支付合规要求。
 
 ---
 
 ## 2. 总体架构
 
 ```text
-[微信小程序] --HTTPS/JWT--> [Go API (Gin)]
-                                 |
-                                 +-- OrderService
-                                 +-- PaymentService (WeChat JSAPI)
-                                 +-- RefundService
-                                 +-- ReconcileService (对账)
-                                 |
-                                 +-- MySQL (核心事务数据)
-                                 +-- Redis (幂等锁、缓存、限流)
-                                 +-- Asynq/Cron (定时任务: 对账/催缴)
+[微信小程序]
+   |
+   | HTTPS + JWT
+   v
+[API 网关 / Gin HTTP 服务]
+   |
+   +--> [订单服务 Order]
+   +--> [支付服务 Payment(微信 JSAPI)]
+   +--> [退款服务 Refund]
+   +--> [学生/班级服务 Student]
+   +--> [管理后台 Admin API]
+   |
+   +--> [MySQL 8.0]
+   +--> [Redis]
+   +--> [消息队列(可选: NATS/RabbitMQ)]
 
-[WeChat Pay]
-   |--- 下单API/退款API
-   |--- 支付回调 --> /api/v1/payments/wechat/notify
-   |--- 退款回调 --> /api/v1/refunds/wechat/notify
+微信侧回调：
+[WeChat Pay Notify] --> [/api/v1/payments/wechat/notify]
 ```
 
-### 2.1 部署建议（2000 学生）
-- Go API：2 实例（2C4G），Nginx/SLB 负载均衡。
-- MySQL 8.0：单主 + 自动备份（全量 + binlog）。
-- Redis：单实例即可（幂等键、锁、缓存）。
-- 定时任务：和 API 同服务进程即可，或单独 worker。
+**建议部署（2000 学生）**
+- 2 台应用实例（主备/负载均衡），每台 2C4G 即可。
+- MySQL 单主 + 自动备份。
+- Redis 单实例（缓存、幂等键、限流）。
 
 ---
 
-## 3. 业务流程（端到端）
+## 3. 核心业务流程
 
-## 3.1 管理员建单
-1. 管理员选择学生或班级，输入标题/金额/截止日。
-2. 服务端校验：金额>0、截止时间合理、学生状态正常。
-3. 写入 `orders`，状态 `PENDING`。
-4. 记录操作日志 `audit_logs`（可选增强表）。
+## 3.1 管理员创建订单
+1. 管理员选择学生（或按班级批量）创建校服订单。
+2. 系统生成 `order_no`、金额、截止时间，状态为 `PENDING`。
+3. 订单写库并推送通知（可选：订阅消息/短信）。
 
-## 3.2 学生支付（JSAPI）
-1. 小程序调用 `POST /api/me/orders/{orderNo}/pay`。
-2. 服务端校验：订单归属、状态 `PENDING`、未超时。
-3. 服务端调用微信 JSAPI 统一下单，得到 `prepay_id`。
-4. 返回前端调起支付参数：`timeStamp/nonceStr/package/paySign/signType`。
-5. 前端调起微信支付。
-6. 微信异步通知服务端支付结果。
-7. 服务端验签 + 解密 + 幂等处理 + 状态机更新。
+## 3.2 学生支付（微信 JSAPI）
+1. 小程序调用后端：`POST /orders/{id}/pay`。
+2. 后端校验订单归属、状态、金额。
+3. 后端调用微信 `transactions/jsapi` 下单，生成 `prepay_id`。
+4. 后端返回前端调起支付所需参数（timeStamp、nonceStr、package、paySign）。
+5. 小程序发起支付。
+6. 微信异步通知后端支付结果。
+7. 后端验签成功后，将订单置为 `PAID`，写支付流水。
 
-## 3.3 退款
-1. 管理员发起退款：`POST /admin/refunds`。
-2. 校验可退金额（不能超过已支付未退款金额）。
-3. 调微信退款 API。
-4. 记录 `refunds` 为 `PROCESSING`。
-5. 收到回调或主动查询后，置 `SUCCESS/FAIL`，并更新 `orders` 的退款相关状态。
-
-## 3.4 每日自动对账
-1. 凌晨定时下载微信交易账单（前一日）。
-2. 与本地 `payments` 按 `out_trade_no` 对比。
-3. 生成 `reconcile_results`：一致/本地缺失/微信缺失/金额不一致/状态不一致。
-4. 差异进入 `reconcile_issues`，派给财务/运营处理。
+## 3.3 退款流程
+1. 管理员发起退款申请。
+2. 后端调用微信退款接口。
+3. 退款结果通过回调或主动查询确认后更新 `refund_status`。
 
 ---
 
 ## 4. 数据库设计（MySQL）
 
-## 4.1 业务核心表
-- `students`：学生主数据 + openid。
-- `orders`：应付订单。
-- `payments`：支付尝试流水。
-- `refunds`：退款流水。
-- `wechat_notify_logs`：微信回调审计。
+## 4.1 核心表
 
-## 4.2 对账相关表（新增）
-- `reconcile_tasks`：每次对账任务。
-- `reconcile_results`：逐笔对账结果。
-- `reconcile_issues`：差异工单。
+### 4.1.1 `students`
+- 存学生基础信息，含小程序 `openid`。
 
-## 4.3 SQL DDL（含对账表）
+### 4.1.2 `orders`
+- 一笔校服应付记录。
+
+### 4.1.3 `payments`
+- 一笔订单可以有多次支付尝试（通常成功 1 次）。
+
+### 4.1.4 `refunds`
+- 退款记录。
+
+### 4.1.5 `wechat_notify_logs`
+- 保存微信回调原文，便于审计与排错。
+
+## 4.2 SQL DDL（可直接落地）
 
 ```sql
 CREATE TABLE students (
@@ -103,9 +89,9 @@ CREATE TABLE students (
   name VARCHAR(64) NOT NULL,
   class_name VARCHAR(64) NOT NULL,
   grade_name VARCHAR(64) NULL,
-  openid VARCHAR(64) NULL UNIQUE COMMENT '小程序openid',
+  openid VARCHAR(64) NULL UNIQUE,
   phone VARCHAR(20) NULL,
-  status TINYINT NOT NULL DEFAULT 1 COMMENT '1正常 0停用',
+  status TINYINT NOT NULL DEFAULT 1 COMMENT '1=正常,0=停用',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_class_name(class_name)
@@ -115,21 +101,19 @@ CREATE TABLE orders (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   order_no VARCHAR(64) NOT NULL UNIQUE COMMENT '业务订单号',
   student_id BIGINT NOT NULL,
-  title VARCHAR(128) NOT NULL,
-  biz_type VARCHAR(32) NOT NULL DEFAULT 'UNIFORM',
-  amount_cent INT NOT NULL COMMENT '应付总额(分)',
-  paid_cent INT NOT NULL DEFAULT 0 COMMENT '已支付金额(分)',
-  refunded_cent INT NOT NULL DEFAULT 0 COMMENT '已退款金额(分)',
-  status VARCHAR(24) NOT NULL COMMENT 'PENDING/PAID/CLOSED/PARTIAL_REFUNDED/REFUNDED',
+  title VARCHAR(128) NOT NULL COMMENT '例如: 2026春季校服',
+  amount_cent INT NOT NULL COMMENT '金额(分)',
+  paid_cent INT NOT NULL DEFAULT 0,
+  status VARCHAR(20) NOT NULL COMMENT 'PENDING/PAID/CLOSED/REFUNDED/PARTIAL_REFUNDED',
   deadline_at DATETIME NULL,
   paid_at DATETIME NULL,
+  biz_type VARCHAR(32) NOT NULL DEFAULT 'UNIFORM',
   ext_json JSON NULL,
-  created_by BIGINT NULL,
+  created_by BIGINT NULL COMMENT '管理员ID',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   CONSTRAINT fk_orders_student FOREIGN KEY (student_id) REFERENCES students(id),
   INDEX idx_student_status(student_id, status),
-  INDEX idx_deadline(deadline_at),
   INDEX idx_created_at(created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -139,10 +123,10 @@ CREATE TABLE payments (
   order_id BIGINT NOT NULL,
   order_no VARCHAR(64) NOT NULL,
   channel VARCHAR(20) NOT NULL DEFAULT 'WECHAT',
-  appid VARCHAR(32) NOT NULL,
   mchid VARCHAR(32) NOT NULL,
-  out_trade_no VARCHAR(64) NOT NULL UNIQUE COMMENT '商户支付单号(幂等键)',
+  appid VARCHAR(32) NOT NULL,
   transaction_id VARCHAR(64) NULL COMMENT '微信支付单号',
+  out_trade_no VARCHAR(64) NOT NULL COMMENT '商户支付单号',
   prepay_id VARCHAR(128) NULL,
   amount_cent INT NOT NULL,
   payer_openid VARCHAR(64) NOT NULL,
@@ -154,6 +138,7 @@ CREATE TABLE payments (
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   CONSTRAINT fk_payments_order FOREIGN KEY (order_id) REFERENCES orders(id),
   INDEX idx_order_id(order_id),
+  INDEX idx_out_trade_no(out_trade_no),
   INDEX idx_transaction_id(transaction_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -162,7 +147,7 @@ CREATE TABLE refunds (
   refund_no VARCHAR(64) NOT NULL UNIQUE,
   order_id BIGINT NOT NULL,
   payment_id BIGINT NOT NULL,
-  out_refund_no VARCHAR(64) NOT NULL UNIQUE COMMENT '商户退款单号(幂等键)',
+  out_refund_no VARCHAR(64) NOT NULL,
   refund_id VARCHAR(64) NULL COMMENT '微信退款单号',
   reason VARCHAR(255) NULL,
   refund_cent INT NOT NULL,
@@ -174,7 +159,8 @@ CREATE TABLE refunds (
   CONSTRAINT fk_refunds_order FOREIGN KEY (order_id) REFERENCES orders(id),
   CONSTRAINT fk_refunds_payment FOREIGN KEY (payment_id) REFERENCES payments(id),
   INDEX idx_order_id(order_id),
-  INDEX idx_payment_id(payment_id)
+  INDEX idx_payment_id(payment_id),
+  INDEX idx_out_refund_no(out_refund_no)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE wechat_notify_logs (
@@ -192,505 +178,213 @@ CREATE TABLE wechat_notify_logs (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_notify_type_created(notify_type, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE reconcile_tasks (
-  id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  task_no VARCHAR(64) NOT NULL UNIQUE,
-  bill_date DATE NOT NULL COMMENT '对账日期(账单日)',
-  channel VARCHAR(20) NOT NULL DEFAULT 'WECHAT',
-  status VARCHAR(20) NOT NULL COMMENT 'INIT/RUNNING/SUCCESS/PARTIAL_FAIL/FAIL',
-  total_count INT NOT NULL DEFAULT 0,
-  match_count INT NOT NULL DEFAULT 0,
-  diff_count INT NOT NULL DEFAULT 0,
-  remark VARCHAR(255) NULL,
-  started_at DATETIME NULL,
-  finished_at DATETIME NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uk_bill_date_channel (bill_date, channel)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE reconcile_results (
-  id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  task_id BIGINT NOT NULL,
-  bill_date DATE NOT NULL,
-  out_trade_no VARCHAR(64) NOT NULL,
-  transaction_id VARCHAR(64) NULL,
-  wechat_amount_cent INT NOT NULL DEFAULT 0,
-  local_amount_cent INT NOT NULL DEFAULT 0,
-  wechat_status VARCHAR(20) NULL,
-  local_status VARCHAR(20) NULL,
-  result_type VARCHAR(32) NOT NULL COMMENT 'MATCH/LOCAL_MISSING/WECHAT_MISSING/AMOUNT_MISMATCH/STATUS_MISMATCH',
-  detail_json JSON NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT fk_reconcile_results_task FOREIGN KEY (task_id) REFERENCES reconcile_tasks(id),
-  INDEX idx_task_result(task_id, result_type),
-  INDEX idx_out_trade_no(out_trade_no)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE reconcile_issues (
-  id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  task_id BIGINT NOT NULL,
-  result_id BIGINT NOT NULL,
-  issue_no VARCHAR(64) NOT NULL UNIQUE,
-  issue_type VARCHAR(32) NOT NULL,
-  issue_status VARCHAR(20) NOT NULL DEFAULT 'OPEN' COMMENT 'OPEN/PROCESSING/RESOLVED/CLOSED',
-  handler VARCHAR(64) NULL,
-  resolution VARCHAR(255) NULL,
-  resolved_at DATETIME NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  CONSTRAINT fk_reconcile_issues_task FOREIGN KEY (task_id) REFERENCES reconcile_tasks(id),
-  CONSTRAINT fk_reconcile_issues_result FOREIGN KEY (result_id) REFERENCES reconcile_results(id),
-  INDEX idx_issue_status(issue_status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ---
 
-## 5. 状态机设计（非常关键）
-
-### 5.1 订单状态 `orders.status`
-- `PENDING`：待支付。
-- `PAID`：已支付。
-- `CLOSED`：已关闭（超时/人工关闭）。
-- `PARTIAL_REFUNDED`：部分退款。
-- `REFUNDED`：全额退款。
-
-**合法流转**
-- `PENDING -> PAID`
-- `PENDING -> CLOSED`
-- `PAID -> PARTIAL_REFUNDED`
-- `PAID/PARTIAL_REFUNDED -> REFUNDED`
-
-### 5.2 支付状态 `payments.status`
-- `CREATED -> SUCCESS/FAIL/CLOSED`
-
-### 5.3 退款状态 `refunds.status`
-- `PROCESSING -> SUCCESS/FAIL/CLOSED`
-
-> 建议在 service 层封装状态流转函数，所有写状态必须经过统一校验，不允许 DAO 直接任意更新。
-
----
-
-## 6. Go 项目结构（含职责）
+## 5. Go 项目结构建议（单体分层，易演进）
 
 ```text
 .
-├── cmd/server/main.go
-├── configs/config.yaml
-├── internal
-│   ├── api
-│   │   ├── admin_order_handler.go
-│   │   ├── student_order_handler.go
-│   │   ├── wechat_notify_handler.go
-│   │   └── admin_refund_handler.go
-│   ├── service
-│   │   ├── order_service.go
-│   │   ├── payment_service.go
-│   │   ├── refund_service.go
-│   │   └── reconcile_service.go
-│   ├── repo
-│   │   ├── order_repo.go
-│   │   ├── payment_repo.go
-│   │   ├── refund_repo.go
-│   │   └── reconcile_repo.go
-│   ├── wechatpay
-│   │   ├── client.go
-│   │   ├── verify.go
-│   │   └── types.go
-│   ├── job
-│   │   └── reconcile_job.go
-│   └── middleware
-│       ├── auth.go
-│       ├── trace.go
-│       └── rate_limit.go
-└── migrations
+├── cmd/
+│   └── server/main.go
+├── internal/
+│   ├── api/              # gin handler
+│   ├── service/          # 核心业务
+│   ├── repo/             # DAO
+│   ├── model/            # 实体/DTO
+│   ├── wechatpay/        # 微信支付客户端封装
+│   ├── middleware/       # JWT、日志、幂等等
+│   └── pkg/
+│       ├── xerr/
+│       ├── xid/
+│       └── xlog/
+├── configs/
+│   └── config.yaml
+├── migrations/
+└── go.mod
 ```
 
 ---
 
-## 7. 核心接口定义（含请求/响应示例）
+## 6. 关键接口设计（REST）
 
-## 7.1 学生侧：创建支付
-`POST /api/me/orders/{orderNo}/pay`
+## 6.1 管理端
+- `POST /admin/orders`：创建单个订单
+- `POST /admin/orders/batch`：按班级批量建单
+- `GET /admin/orders`：订单列表
+- `POST /admin/orders/{orderNo}/close`：关闭未支付订单
+- `POST /admin/refunds`：发起退款
 
-响应：
-```json
-{
-  "timeStamp": "1710000000",
-  "nonceStr": "abc123",
-  "package": "prepay_id=wx201410272009395522657a690389285100",
-  "signType": "RSA",
-  "paySign": "xxxx"
-}
-```
+## 6.2 学生端（小程序）
+- `GET /api/me/orders`：我的订单列表
+- `GET /api/me/orders/{orderNo}`：订单详情
+- `POST /api/me/orders/{orderNo}/pay`：创建微信支付参数
 
-## 7.2 微信支付回调
-`POST /api/v1/payments/wechat/notify`
-- Header 带签名字段；Body 为加密资源。
-- 返回必须是微信要求格式：
-```json
-{"code":"SUCCESS","message":"成功"}
-```
-
-## 7.3 管理侧：发起退款
-`POST /admin/refunds`
-
-请求：
-```json
-{
-  "orderNo": "ORD202601010001",
-  "refundCent": 5000,
-  "reason": "尺码不合适"
-}
-```
+## 6.3 微信回调
+- `POST /api/v1/payments/wechat/notify`：支付结果通知
+- `POST /api/v1/refunds/wechat/notify`：退款结果通知
 
 ---
 
-## 8. 关键代码示例（含注解）
+## 7. 关键代码骨架（示例）
 
-## 8.1 `payment_service.go`：创建 JSAPI 支付
+## 7.1 下单服务（核心逻辑）
 
 ```go
-package service
-
-import (
-	"context"
-	"errors"
-	"time"
-)
-
-// PaymentService 支付业务服务
-type PaymentService struct {
-	orderRepo   OrderRepo
-	studentRepo StudentRepo
-	paymentRepo PaymentRepo
-	wechat      WechatClient
-	idGen       IDGenerator
-	cfg         Config
-}
-
-// CreateJSAPIPay 为学生创建微信 JSAPI 支付参数
 func (s *PaymentService) CreateJSAPIPay(ctx context.Context, studentID int64, orderNo string) (*PayParams, error) {
-	// 1) 查询订单并做归属校验
-	order, err := s.orderRepo.GetByOrderNo(ctx, orderNo)
-	if err != nil {
-		return nil, err
-	}
-	if order.StudentID != studentID {
-		return nil, errors.New("forbidden")
-	}
+    order, err := s.orderRepo.GetByOrderNo(ctx, orderNo)
+    if err != nil {
+        return nil, err
+    }
+    if order.StudentID != studentID {
+        return nil, ErrForbidden
+    }
+    if order.Status != "PENDING" {
+        return nil, ErrOrderStatus
+    }
 
-	// 2) 状态 + 截止时间校验
-	if order.Status != "PENDING" {
-		return nil, errors.New("order status invalid")
-	}
-	if order.DeadlineAt != nil && order.DeadlineAt.Before(time.Now()) {
-		return nil, errors.New("order expired")
-	}
+    student, err := s.studentRepo.GetByID(ctx, studentID)
+    if err != nil {
+        return nil, err
+    }
+    if student.OpenID == "" {
+        return nil, ErrOpenIDRequired
+    }
 
-	// 3) 获取学生 openid（微信 JSAPI 必填）
-	stu, err := s.studentRepo.GetByID(ctx, studentID)
-	if err != nil {
-		return nil, err
-	}
-	if stu.OpenID == "" {
-		return nil, errors.New("openid required")
-	}
+    paymentNo := s.idGen.New("PAY")
+    outTradeNo := paymentNo
 
-	// 4) 生成商户单号（强幂等建议：一个订单同一时刻只允许一个有效支付单）
-	outTradeNo := s.idGen.New("PAY")
+    // 幂等：避免重复创建支付单
+    if exist, _ := s.paymentRepo.GetByOutTradeNo(ctx, outTradeNo); exist != nil {
+        return s.wechat.BuildPayParams(exist.PrepayID), nil
+    }
 
-	// 5) 调微信下单
-	prepay, err := s.wechat.CreateJSAPIOrder(ctx, WechatPrepayReq{
-		OutTradeNo:  outTradeNo,
-		Description: order.Title,
-		AmountCent:  order.AmountCent,
-		PayerOpenID: stu.OpenID,
-		NotifyURL:   s.cfg.WechatPay.NotifyURL,
-	})
-	if err != nil {
-		return nil, err
-	}
+    prepayResp, err := s.wechat.CreateJSAPIOrder(ctx, WechatPrepayReq{
+        OutTradeNo:  outTradeNo,
+        Description: order.Title,
+        AmountCent:  order.AmountCent,
+        PayerOpenID: student.OpenID,
+        NotifyURL:   s.cfg.WechatPay.NotifyURL,
+    })
+    if err != nil {
+        return nil, err
+    }
 
-	// 6) 落支付流水
-	err = s.paymentRepo.Create(ctx, &Payment{
-		PaymentNo:  s.idGen.New("PMT"),
-		OrderID:    order.ID,
-		OrderNo:    order.OrderNo,
-		OutTradeNo: outTradeNo,
-		PrepayID:   prepay.PrepayID,
-		AmountCent: order.AmountCent,
-		PayerOpenID: stu.OpenID,
-		Status:     "CREATED",
-	})
-	if err != nil {
-		return nil, err
-	}
+    _ = s.paymentRepo.Create(ctx, &Payment{
+        PaymentNo:  paymentNo,
+        OrderID:    order.ID,
+        OrderNo:    order.OrderNo,
+        OutTradeNo: outTradeNo,
+        PrepayID:   prepayResp.PrepayID,
+        AmountCent: order.AmountCent,
+        Status:     "CREATED",
+    })
 
-	// 7) 返回小程序调起参数
-	return s.wechat.BuildPayParams(prepay.PrepayID), nil
+    return s.wechat.BuildPayParams(prepayResp.PrepayID), nil
 }
 ```
 
-## 8.2 `wechat_notify_handler.go`：支付回调处理
+## 7.2 微信支付回调处理（幂等 + 验签）
 
 ```go
-package api
+func (h *WechatHandler) PayNotify(c *gin.Context) {
+    body, _ := io.ReadAll(c.Request.Body)
 
-import (
-	"io"
-	"net/http"
-	"time"
+    if err := h.wechat.VerifySignature(c.Request.Header, body); err != nil {
+        c.JSON(http.StatusOK, gin.H{"code": "FAIL", "message": "invalid signature"})
+        return
+    }
 
-	"github.com/gin-gonic/gin"
-)
+    notify, err := h.wechat.DecryptNotify(body)
+    if err != nil {
+        c.JSON(http.StatusOK, gin.H{"code": "FAIL", "message": "decrypt failed"})
+        return
+    }
 
-// PayNotify 微信支付回调入口
-func (h *WechatNotifyHandler) PayNotify(c *gin.Context) {
-	body, _ := io.ReadAll(c.Request.Body)
+    // 幂等锁: Redis SETNX(out_trade_no, 1, 30s)
+    locked := h.locker.TryLock(c, "wxpay_notify:"+notify.OutTradeNo, 30*time.Second)
+    if !locked {
+        c.JSON(http.StatusOK, gin.H{"code": "SUCCESS", "message": "duplicate"})
+        return
+    }
+    defer h.locker.Unlock(c, "wxpay_notify:"+notify.OutTradeNo)
 
-	// 1) 记录原始回调日志（建议先记日志，再处理）
-	logID, _ := h.notifyLogRepo.CreateRaw(c, "PAY", c.Request.Header, body)
+    err = h.paymentSvc.MarkPaymentSuccess(c, notify)
+    if err != nil {
+        c.JSON(http.StatusOK, gin.H{"code": "FAIL", "message": "process failed"})
+        return
+    }
 
-	// 2) 验签（微信支付v3）
-	if err := h.wechat.VerifySignature(c.Request.Header, body); err != nil {
-		h.notifyLogRepo.Mark(c, logID, "FAIL", "invalid signature")
-		c.JSON(http.StatusOK, gin.H{"code": "FAIL", "message": "invalid signature"})
-		return
-	}
-
-	// 3) 解密 resource
-	notify, err := h.wechat.DecryptPayNotify(body)
-	if err != nil {
-		h.notifyLogRepo.Mark(c, logID, "FAIL", "decrypt failed")
-		c.JSON(http.StatusOK, gin.H{"code": "FAIL", "message": "decrypt failed"})
-		return
-	}
-
-	// 4) 防重：分布式锁（同一个 out_trade_no 只处理一次）
-	lockKey := "wxpay_notify:" + notify.OutTradeNo
-	if ok := h.locker.TryLock(c, lockKey, 30*time.Second); !ok {
-		h.notifyLogRepo.Mark(c, logID, "REPEAT", "duplicate notify")
-		c.JSON(http.StatusOK, gin.H{"code": "SUCCESS", "message": "duplicate"})
-		return
-	}
-	defer h.locker.Unlock(c, lockKey)
-
-	// 5) 事务更新 payment + order 状态
-	if err := h.paymentSvc.MarkPaymentSuccess(c, notify); err != nil {
-		h.notifyLogRepo.Mark(c, logID, "FAIL", err.Error())
-		c.JSON(http.StatusOK, gin.H{"code": "FAIL", "message": "process failed"})
-		return
-	}
-
-	h.notifyLogRepo.Mark(c, logID, "SUCCESS", "ok")
-	c.JSON(http.StatusOK, gin.H{"code": "SUCCESS", "message": "成功"})
-}
-```
-
-## 8.3 `payment_service.go`：回调落库事务（重点）
-
-```go
-func (s *PaymentService) MarkPaymentSuccess(ctx context.Context, n PayNotify) error {
-	return s.txManager.WithTx(ctx, func(txCtx context.Context) error {
-		p, err := s.paymentRepo.GetByOutTradeNoForUpdate(txCtx, n.OutTradeNo)
-		if err != nil {
-			return err
-		}
-		if p == nil {
-			return errors.New("payment not found")
-		}
-
-		// 幂等：已经成功则直接返回
-		if p.Status == "SUCCESS" {
-			return nil
-		}
-
-		// 更新支付状态
-		if err := s.paymentRepo.MarkSuccess(txCtx, p.ID, n.TransactionID, n.SuccessTime); err != nil {
-			return err
-		}
-
-		// 锁订单并更新
-		o, err := s.orderRepo.GetByIDForUpdate(txCtx, p.OrderID)
-		if err != nil {
-			return err
-		}
-		if o.Status != "PENDING" {
-			// 若订单已非待支付，不回滚支付状态，记录异常待人工
-			return nil
-		}
-		return s.orderRepo.MarkPaid(txCtx, o.ID, o.AmountCent, n.SuccessTime)
-	})
-}
-```
-
-## 8.4 `reconcile_job.go`：每日对账任务（核心示例）
-
-```go
-package job
-
-import (
-	"context"
-	"time"
-)
-
-// RunDailyReconcile 每日凌晨运行：对前一日账单进行对账
-func (j *ReconcileJob) RunDailyReconcile(ctx context.Context) error {
-	billDate := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-
-	// 1) 创建任务记录
-	task, err := j.reconcileSvc.StartTask(ctx, billDate)
-	if err != nil {
-		return err
-	}
-
-	// 2) 拉取微信账单（可先下载文件，再解析成结构化记录）
-	wxRows, err := j.wechat.DownloadAndParseTradeBill(ctx, billDate)
-	if err != nil {
-		_ = j.reconcileSvc.FailTask(ctx, task.ID, err.Error())
-		return err
-	}
-
-	// 3) 逐笔比对
-	for _, row := range wxRows {
-		_ = j.reconcileSvc.CompareOne(ctx, task.ID, row)
-	}
-
-	// 4) 补查：本地成功但微信账单未出现（可能漏单/账单延迟）
-	_ = j.reconcileSvc.FindLocalMissingInWechat(ctx, task.ID, billDate)
-
-	// 5) 汇总任务状态
-	return j.reconcileSvc.FinishTask(ctx, task.ID)
+    c.JSON(http.StatusOK, gin.H{"code": "SUCCESS", "message": "成功"})
 }
 ```
 
 ---
 
-## 9. 对账规则（建议直接照搬）
+## 8. 安全与风控要点
 
-按 `out_trade_no` 主键对比：
-
-1. 本地有，微信无：`WECHAT_MISSING`
-   - 原因：账单延迟、单号错误、微信侧未成功。
-2. 微信有，本地无：`LOCAL_MISSING`
-   - 原因：回调丢失、入库失败。
-3. 金额不一致：`AMOUNT_MISMATCH`
-   - 必须人工确认，通常是数据异常。
-4. 状态不一致：`STATUS_MISMATCH`
-   - 常见：微信成功，本地仍 CREATED。
-5. 全部一致：`MATCH`
-
-处理建议：
-- `LOCAL_MISSING`：自动补单（调用订单查询 API 二次确认后修复）。
-- `WECHAT_MISSING`：延迟一天重试再升级人工。
-- `AMOUNT_MISMATCH`：直接人工优先处理。
+- **金额可信源在后端**：前端传金额一律忽略，后端按订单金额支付。
+- **回调验签必须做**：严格按微信支付 v3 证书验签。
+- **幂等处理**：
+  - 创建支付：按 `out_trade_no` 去重。
+  - 回调处理：分布式锁 + 状态机校验。
+- **状态机约束**：只允许 `PENDING -> PAID`，防止状态回滚。
+- **审计日志**：保存回调原文、关键操作人、退款原因。
+- **权限隔离**：管理端与学生端 JWT 使用不同 `aud`/`role`。
 
 ---
 
-## 10. 幂等与一致性策略
+## 9. 性能与容量评估（2000学生）
 
-### 10.1 幂等点
-- 下单幂等：`out_trade_no` 唯一。
-- 支付回调幂等：`out_trade_no + 分布式锁 + DB 行锁`。
-- 退款幂等：`out_refund_no` 唯一。
-
-### 10.2 一致性
-- 关键更新都在事务内（支付状态 + 订单状态）。
-- 回调先记日志后处理，任何失败可重放。
-- 对账任务兜底修复漏单。
+- 峰值场景（统一收费通知后 10 分钟内集中支付）估算：
+  - 假设 20% 学生在短时间支付 ≈ 400 笔。
+  - 峰值 QPS 通常 < 30（足够低）。
+- MySQL + Redis 单实例可支撑。
+- 建议预留：应用层连接池、慢 SQL 监控、接口限流。
 
 ---
 
-## 11. 安全与合规
+## 10. 部署与运维建议
 
-- 前端金额不可信，以后端订单金额为准。
-- 微信回调必须验签、验时间戳、验商户号。
-- 密钥（APIv3 Key、私钥）必须环境变量/密管系统，不入库不入 git。
-- 管理端和学生端 JWT 分开 audience / role。
-- 重要接口加限流与操作审计。
-
----
-
-## 12. 配置样例（`config.yaml`）
-
-```yaml
-server:
-  addr: ":8080"
-  read_timeout: 5s
-  write_timeout: 10s
-
-database:
-  dsn: "user:pass@tcp(127.0.0.1:3306)/school_pay?charset=utf8mb4&parseTime=True&loc=Local"
-  max_open_conns: 50
-  max_idle_conns: 10
-
-redis:
-  addr: "127.0.0.1:6379"
-  db: 0
-
-wechat_pay:
-  appid: "wx123"
-  mchid: "1900000109"
-  notify_url: "https://pay.yourschool.com/api/v1/payments/wechat/notify"
-  refund_notify_url: "https://pay.yourschool.com/api/v1/refunds/wechat/notify"
-  serial_no: "XXXX"
-  private_key_path: "/etc/secrets/apiclient_key.pem"
-  platform_cert_path: "/etc/secrets/wechat_platform_cert.pem"
-```
+- **配置管理**：`config.yaml` + 环境变量覆盖（密钥放环境变量）。
+- **日志**：JSON 结构化日志，字段包含 `trace_id/order_no/payment_no`。
+- **监控**：
+  - 接口成功率、P95 延迟
+  - 微信下单失败率
+  - 回调处理失败告警
+- **备份**：MySQL 每日全备 + Binlog，至少保留 30 天。
 
 ---
 
-## 13. 性能容量与优化建议（2000 学生）
+## 11. 开发里程碑（建议）
 
-- 统一通知后的峰值，估算 QPS < 30，系统压力不大。
-- 优化重点不是“吞吐”，而是“稳定与一致性”：
-  - 减少支付失败重试。
-  - 回调处理快速应答。
-  - 对账任务可追溯。
-- 索引优化：
-  - `payments.out_trade_no` 唯一索引（必备）。
-  - `orders(student_id, status)` 复合索引。
-  - 对账结果按 `task_id + result_type` 索引。
+1. **MVP（1~2周）**：学生、订单、微信 JSAPI 下单、支付回调。
+2. **增强（第3周）**：批量建单、后台筛选导出、退款。
+3. **完善（第4周）**：监控告警、对账脚本、自动化测试。
 
 ---
 
-## 14. 里程碑（4周建议）
+## 12. 对账与财务闭环（强烈建议）
 
-1. 第1周：学生、订单、登录、基础后台。
-2. 第2周：微信下单 + 支付回调 + 幂等。
-3. 第3周：退款 + 退款回调 + 操作审计。
-4. 第4周：每日对账任务 + 差异工单 + 监控告警。
-
----
-
-## 15. 测试清单（上线前）
-
-### 功能测试
-- 正常下单支付。
-- 重复点击支付按钮（幂等）。
-- 回调重复推送（幂等）。
-- 订单过期后支付。
-- 部分退款、全额退款。
-
-### 异常测试
-- 微信回调签名错误。
-- 回调解密失败。
-- DB 事务中断后重试。
-- 对账任务下载失败重试。
-
-### 压测建议
-- 模拟 500 并发调用 `pay` 接口，观察错误率与耗时。
-- 模拟 1000 条重复回调，确保只处理一次。
+- 每日凌晨下载微信账单（交易单、资金账单）。
+- 按 `out_trade_no` 与本地 `payments` 对账。
+- 输出差异单（漏单、金额不一致、状态不一致）。
+- 差异单自动进入人工处理队列。
 
 ---
 
-## 16. 下一步可直接交付内容
+## 13. 你可以直接照着做的技术选型
 
-如果你需要，我可以继续给你以下“可运行代码版”：
-1. 完整 `main.go`（路由、配置加载、MySQL/Redis 初始化）。
-2. `payment_service.go` + `wechat_notify_handler.go` 的可编译版本。
-3. `reconcile_job.go` + 对账 CSV 解析代码。
-4. 一份 Postman 集合 + 初始化 SQL + 演示数据。
+- Web: `gin`
+- ORM: `gorm`（或 `sqlc`）
+- DB: `MySQL 8.0`
+- Cache/Lock: `Redis`
+- Auth: `JWT`
+- 微信支付 SDK: `wechatpay-apiv3` 官方 Go SDK
+- Job: `asynq`（可选，用于通知、对账任务）
+
+如果你愿意，我下一步可以给你：
+1) 一份可直接运行的 **Go 项目脚手架**（含 `main.go`、路由、配置、数据库连接）；
+2) 完整的 **支付下单/回调代码**（可复制粘贴）；
+3) 一套 **Postman 接口集合** 和初始化 SQL。
